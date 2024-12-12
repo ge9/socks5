@@ -50,3 +50,16 @@ var DialUDP func(network string, laddr, raddr string) (net.Conn, error) = func(n
 	ra = a.(*net.UDPAddr)
 	return net.DialUDP(network, la, ra)
 }
+
+// custom listener for outgoing requests in full cone NAT mode (used without remote address)
+var BindOutUDP func(network string, laddr string) (net.PacketConn, error) = func(network string, laddr string) (net.PacketConn, error) {
+	var la *net.UDPAddr
+	if laddr != "" {
+		var err error
+		la, err = net.ResolveUDPAddr(network, laddr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return net.ListenUDP(network, la)
+}

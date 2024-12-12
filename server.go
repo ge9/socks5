@@ -31,6 +31,7 @@ type Server struct {
 	ServerAddr        net.Addr
 	UDPConn           *net.UDPConn
 	UDPExchanges      *cache.Cache
+	UDPAddrtoHost     *cache.Cache
 	TCPTimeout        int
 	UDPTimeout        int
 	Handle            Handler
@@ -44,7 +45,7 @@ type Server struct {
 // UDPExchange used to store client address and remote connection
 type UDPExchange struct {
 	ClientAddr *net.UDPAddr
-	RemoteConn net.Conn
+	RemoteConn net.PacketConn
 }
 
 // NewClassicServer return a server which allow none method
@@ -72,6 +73,7 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 		Addr:              addr,
 		ServerAddr:        saddr,
 		UDPExchanges:      cs,
+		UDPAddrtoHost:     cs,
 		TCPTimeout:        tcpTimeout,
 		UDPTimeout:        udpTimeout,
 		AssociatedUDP:     cs1,
@@ -330,25 +332,28 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		}
 		ch = any.(chan byte)
 	}
+
+	dst := d.Address()
+	udpaddr, err := net.ResolveUDPAddr("udp", dst) //TODO: handle error
+	s.UDPAddrtoHost.Set(udpaddr.String(), dst, -1)
 	send := func(ue *UDPExchange, data []byte) error {
 		select {
 		case <-ch:
 			return fmt.Errorf("This udp address %s is not associated with tcp", src)
 		default:
-			_, err := ue.RemoteConn.Write(data)
+			_, err := ue.RemoteConn.WriteTo(data, udpaddr)
 			if err != nil {
 				return err
 			}
 			if Debug {
-				log.Printf("Sent UDP data to remote. client: %#v server: %#v remote: %#v data: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), ue.RemoteConn.RemoteAddr().String(), data)
+				log.Printf("Sent UDP data to remote. client: %#v server: %#v remote: %#v data: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), dst, data)
 			}
 		}
 		return nil
 	}
 
-	dst := d.Address()
 	var ue *UDPExchange
-	iue, ok := s.UDPExchanges.Get(src + dst)
+	iue, ok := s.UDPExchanges.Get(src)
 	if ok {
 		ue = iue.(*UDPExchange)
 		return send(ue, d.Data)
@@ -358,23 +363,23 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		log.Printf("Call udp: %#v\n", dst)
 	}
 	var laddr string
-	any, ok := s.UDPSrc.Get(src + dst)
+	any, ok := s.UDPSrc.Get(src)
 	if ok {
 		laddr = any.(string)
 	}
-	rc, err := DialUDP("udp", laddr, dst)
+	rc, err := BindOutUDP("udp", laddr)
 	if err != nil {
 		if !strings.Contains(err.Error(), "address already in use") && !strings.Contains(err.Error(), "can't assign requested address") {
 			return err
 		}
-		rc, err = DialUDP("udp", "", dst)
+		rc, err = BindOutUDP("udp", "")
 		if err != nil {
 			return err
 		}
 		laddr = ""
 	}
 	if laddr == "" {
-		s.UDPSrc.Set(src+dst, rc.LocalAddr().String(), -1)
+		s.UDPSrc.Set(src, rc.LocalAddr().String(), -1)
 	}
 	ue = &UDPExchange{
 		ClientAddr: addr,
@@ -387,11 +392,11 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		ue.RemoteConn.Close()
 		return err
 	}
-	s.UDPExchanges.Set(src+dst, ue, -1)
+	s.UDPExchanges.Set(src, ue, -1)
 	go func(ue *UDPExchange, dst string) {
 		defer func() {
 			ue.RemoteConn.Close()
-			s.UDPExchanges.Delete(ue.ClientAddr.String() + dst)
+			s.UDPExchanges.Delete(ue.ClientAddr.String())
 		}()
 		var b [65507]byte
 		for {
@@ -408,14 +413,18 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 						return
 					}
 				}
-				n, err := ue.RemoteConn.Read(b[:])
+				n, addr1, err := ue.RemoteConn.ReadFrom(b[:])
 				if err != nil {
 					return
 				}
+				dstorg, ok := s.UDPAddrtoHost.Get(addr1.String()) //TODO: test this for "domain address type" (but I don't know any SOCKS5 client that use domain for UDP associate relay packet)
 				if Debug {
-					log.Printf("Got UDP data from remote. client: %#v server: %#v remote: %#v data: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), ue.RemoteConn.RemoteAddr().String(), b[0:n])
+					log.Printf("Got UDP data from remote. client: %#v server: %#v remote: %#v data: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), addr1.String(), b[0:n])
 				}
-				a, addr, port, err := ParseAddress(dst)
+				if !ok {
+					dstorg = addr1.String()
+				}
+				a, addr, port, err := ParseAddress(dstorg.(string))
 				if err != nil {
 					log.Println(err)
 					return
@@ -428,7 +437,7 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 					return
 				}
 				if Debug {
-					log.Printf("Sent Datagram. client: %#v server: %#v remote: %#v data: %#v %#v %#v %#v %#v %#v datagram address: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), ue.RemoteConn.RemoteAddr().String(), d1.Rsv, d1.Frag, d1.Atyp, d1.DstAddr, d1.DstPort, d1.Data, d1.Address())
+					log.Printf("Sent Datagram. client: %#v server: %#v remote: %#v data: %#v %#v %#v %#v %#v %#v datagram address: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), addr1, d1.Rsv, d1.Frag, d1.Atyp, d1.DstAddr, d1.DstPort, d1.Data, d1.Address())
 				}
 			}
 		}
