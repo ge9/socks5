@@ -18,6 +18,8 @@ type Client struct {
 	TCPTimeout    int
 	UDPTimeout    int
 	Dst           string
+	DialTCP       func(network string, laddr, raddr string) (net.Conn, error)
+	DialUDP       func(network string, laddr, raddr string) (net.Conn, error)
 }
 
 // This is just create a client, you need to use Dial to create conn
@@ -28,6 +30,8 @@ func NewClient(addr, username, password string, tcpTimeout, udpTimeout int) (*Cl
 		Password:   password,
 		TCPTimeout: tcpTimeout,
 		UDPTimeout: udpTimeout,
+		DialTCP:    DialTCP,
+		DialUDP:    DialUDP,
 	}
 	return c, nil
 }
@@ -47,6 +51,8 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 		UDPTimeout:    c.UDPTimeout,
 		Dst:           dst,
 		RemoteAddress: remoteAddr,
+		DialTCP:       c.DialTCP,
+		DialUDP:       c.DialUDP,
 	}
 	var err error
 	if network == "tcp" {
@@ -98,7 +104,7 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 		if err != nil {
 			return nil, err
 		}
-		c.UDPConn, err = DialUDP("udp", src, rp.Address())
+		c.UDPConn, err = c.DialUDP("udp", src, rp.Address())
 		if err != nil {
 			return nil, err
 		}
@@ -202,7 +208,7 @@ func (c *Client) Negotiate(laddr net.Addr) error {
 		src = laddr.String()
 	}
 	var err error
-	c.TCPConn, err = DialTCP("tcp", src, c.Server)
+	c.TCPConn, err = c.DialTCP("tcp", src, c.Server)
 	if err != nil {
 		return err
 	}
